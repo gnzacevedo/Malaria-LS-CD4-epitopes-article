@@ -1,0 +1,961 @@
+---
+title: "Antigen selection pipeline"
+author: "Gonzalo Acevedo"
+date: "9/5/2024"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    code_fold: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Purpose  
+
+The purpose of this document is to reproduce the pipeline used to score genes on the basis of their expression in different *Plasmodium* species and life cycle stages, with the goal of selecting liver stage candidates.  
+
+## Set up  
+
+```{r}
+library(dplyr)
+library(magrittr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(ggrepel)
+library(ggpubr)
+library(patchwork)
+library(openxlsx)
+
+source('~/R projects/scriptsCommon/colorworks.R')
+```
+
+## Integrate the datasets
+
+### Gather the data   
+
+RNA-seq data for different species and life cycle stages was retrieved from PlasmoDB as separate datasets. They need to be integrated before they can be used.
+For some datasets with multiple replicates, the expression of a gene is summarized as the mean or the geometric mean of all values.
+
+```{r}
+geomean <- function(x){exp(mean(log(x)))}
+```
+
+#### *P. cynomolgi* datasets  
+
+- Pcyn 100 days blood  
+
+```{r}
+pcyn100 <- read.delim('Data/PlasmoDB/Pcyn_100daysBloodRNAseq.txt')
+pcyn100 <- pcyn100[,(!grepl('antisense', colnames(pcyn100)))]
+pcyn100 <- pcyn100[,!(grepl('sense', colnames(pcyn100)) & ! grepl('unique.only', colnames(pcyn100)))]
+pcyn100 %<>% select(-X)
+pcyn100 <- pcyn100[,!(grepl('sense', colnames(pcyn100)) & !grepl('WB.+TP2', colnames(pcyn100)))] #TP2 corresponds to acute parasitemia, WB is for whole blood
+colnames(pcyn100) <- gsub('(.+\\.\\.\\.WB_)(.+)(\\.TP2\\.\\.\\.unique.only)','\\2',colnames(pcyn100))
+pcyn100 %<>% rename('P.cyn.Gene.ID'='Gene.ID')
+head(pcyn100)
+```
+
+- Join with *P. falciparum* orthology table
+
+```{r}
+pcyn_ort <- read.delim('Data/PlasmoDB/PcynPfal_SyntenicOrthologs.txt')
+
+pcyn100 <- merge(pcyn100, pcyn_ort, by.x='P.cyn.Gene.ID', by.y='Input.Ortholog.s.', all.x=TRUE, all.y=FALSE)
+pcyn100 %<>% 
+  filter(!is.na(Gene.ID)) %>%
+  select(-c(source_id.x, source_id.y, X, Gene.Name.or.Symbol.x)) %>% 
+  rename('Gene.Name.or.Symbol'='Gene.Name.or.Symbol.y')
+
+pcyn100 %<>% rowwise() %>% mutate(PcynB.mean=mean(c_across(where(is.numeric))),
+                                  PcynB.max=max(c_across(where(is.numeric)))) %>%
+  ungroup()
+
+pcyn100 %>% slice_sample(n=5)
+```
+
+
+- *P. cynomolgi* liver stages dataset and orthology ####
+
+```{r}
+pcyn <- read.table('Data/PlasmoDB/Cubi_PcynNormalizedCounts.txt', sep='\t', header=TRUE)
+colnames(pcyn)[5:7] <- c('P.cyn.Liver.Schizont','P.cyn.Blood','P.cyn.Hypnozoite')
+pcyn %<>% select(-c(2,3,8))
+pcyn %<>% rename(P.cyn.Gene.ID=Gene.ID, P.cyn.Symbol=Gene.Name.or.Symbol, PcynB.liverDataset=P.cyn.Blood)
+
+pcyn %<>% select(c('P.cyn.Gene.ID','P.cyn.Liver.Schizont','PcynB.liverDataset')) %>%
+  right_join(pcyn_ort %>% select(Input.Ortholog.s., Gene.ID, Gene.Name.or.Symbol),
+              by=c('P.cyn.Gene.ID'='Input.Ortholog.s.')) #I'm keeping the data only for Pc genes that have syntenic orthologs in Pf
+
+pcyn %<>% distinct(.keep_all = T) 
+pcyn %>% slice_sample(n=5)
+```
+
+- Gather all *P. cynomolgi* data  
+
+```{r}
+pcyn %<>%
+  left_join(pcyn100[,c(1,3:6,10,11)],
+            by='P.cyn.Gene.ID')
+
+pcyn %>% slice_sample(n=5)
+```
+
+- The rank of gene expression for the blood stage of *P. cynomolgi* is strongly correlated between the two datasets available, especially for genes with very high and very low expression (which are the most interesting for our search). No 
+
+```{r}
+pcyn %>%
+  mutate_at(.vars=c('PcynB.liverDataset','PcynB.mean'), .funs=rank) %>%
+  ggplot(aes(x=PcynB.liverDataset, y=PcynB.mean))+
+  geom_density2d_filled(show.legend=FALSE)+
+  geom_point(size=0.05, color='white', alpha=0.2)+
+  stat_cor(method='spearman', color='white')+
+  scale_fill_viridis_d(option='mako')+
+  scale_x_continuous(expand=expansion(mult=0))+
+  scale_y_continuous(expand=expansion(mult=0))+
+  theme_classic()+theme(aspect.ratio=1)
+```
+
+- Define PcL and PcD as the log2-transformed fold change and the difference between liver and blood stage expression for each gene
+
+```{r}
+offst <- 0.001
+pcyn %<>%  mutate(PcL=log2( (P.cyn.Liver.Schizont+offst)/(PcynB.mean+offst) ),
+                  PcD=P.cyn.Liver.Schizont-PcynB.mean)
+
+pcyn %>%
+  slice_sample(n=5)
+```
+
+- Visualize distribution of log[2](FC) of gene expression between liver and blood stage
+
+```{r}
+pcyn %>% ggplot(aes(x=PcL))+stat_density()+
+  geom_boxplot(mapping=aes(y=-1e-2), width=0.01)+
+  ggtitle(expr(italic('P. cynomolgi')))+
+  theme_classic()
+```
+
+
+#### *P. vivax* datasets  
+
+- Liver stage dataset
+
+```{r}
+pviv <- read.delim('Data/PlasmoDB/Gural_PvivNormalizedCounts.txt', sep='\t', header=TRUE)
+colnames(pviv)[c(4,5)] <- c('P.viv.Mixed1','P.viv.Mixed2')
+pviv %<>% rename(P.viv.Gene.ID=Gene.ID) %>% select(-c(source_id, X))
+
+pviv_ort <- read.delim('Data/PlasmoDB/PvivPfal_SyntenicOrthologs.txt', sep='\t', header=TRUE)
+pviv_ort %<>% select(-c(source_id, X)) 
+pviv_ort %<>% rename(P.viv.Gene.ID=Input.Ortholog.s.)
+
+pviv %<>%
+  right_join(pviv_ort, by='P.viv.Gene.ID') %>%
+  distinct() %>% 
+  distinct(.keep_all=TRUE)
+
+# Summarize normalized counts for replicates as the mean
+pviv %<>% 
+  rowwise() %>%
+  mutate(Pviv.Lmean=mean(c(P.viv.Mixed1,P.viv.Mixed2))) %>%
+  ungroup()
+
+pviv %>%
+  slice_sample(n=5) 
+```
+
+- IED cycle dataset
+
+```{r}
+#Pviv IED cycle ####
+pviv.B <- read.delim('Data/PlasmoDB/Pviv_IEDCycle.txt') %>% select(-X)
+colnames(pviv.B) <- gsub('(smru.+\\.\\.\\.)(smru.+)(\\.\\.\\..+)', '\\2', colnames(pviv.B))
+pviv.B %<>% rename(P.viv.Gene.ID=Gene.ID)
+
+# Get summary values for blood stage gene expression (max and mean)
+pviv.B %<>% rowwise() %>% mutate(Pviv.Bmax=max(c_across(where(is.numeric))),
+                                 Pviv.Bmean=mean(c_across(where(is.numeric)))) %>%
+  ungroup()
+
+pviv %<>%
+  left_join(pviv.B %>% 
+              select(c('P.viv.Gene.ID', 'Pviv.Bmax', 'Pviv.Bmean')))
+
+```
+
+
+- Define PvL and PvD as the log2-transformed fold change and the difference between liver and blood stage expression for each gene
+
+```{r}
+pviv %<>% rowwise() %>% mutate(PvL=log2((Pviv.Lmean+offst)/(Pviv.Bmax+offst)),
+                               PvD=Pviv.Lmean-Pviv.Bmax) %>%
+  ungroup()
+
+pviv %>% slice_sample(n=5)
+```
+
+- Visualize
+
+```{r}
+pviv %>% ggplot(aes(x=PvL))+stat_density()+
+  geom_boxplot(mapping=aes(y=-1e-2), width=0.01)+
+  ggtitle(expr(italic('P. vivax')))+
+  theme_classic()
+```
+
+
+#### *P. falciparum*  datasets
+
+##### Seven stages (López-Barragán)
+
+```{r}
+sevenstg <-  read.delim('Data/PlasmoDB/LopezBarragan_Pf7stagesNormalizedCounts.txt')
+colnames(sevenstg)[6:12] <- gsub('(P..falciparum.Su.Seven.Stages.RNA.Seq.data...)(.+)(...unique..3D7.7Stages.RNA.Seq.)', '\\2', colnames(sevenstg[6:12]))
+colnames(sevenstg) <- gsub(' ', '\\.', colnames(sevenstg))
+sevenstg %<>% select(-c(source_id, Product.Description, gene_source_id, Ookinete, X))
+sevenstg %<>% distinct(.keep_all=TRUE)
+
+#Summarize gene expression in Pf blood stages as the max expression with exclusion of gametocytes
+sevenstg %<>% 
+  rowwise() %>% 
+  mutate(seven.max=max(c_across(where(is.numeric))),
+         seven.max.excl.gam=max(Ring,Early.Trophozoite,Late.Trophozoite,Schizont))
+
+sevenstg %>% 
+  slice_sample(n=5)
+```
+
+
+
+##### Bartfai time series  
+
+```{r}
+idc.B <- read.xlsx('Data/PlasmoDB/Bartfai_PfIDCtimepoints.xlsx')
+colnames(idc.B) <- gsub('(sense...)(.+)(...unique.+)', '\\2', colnames(idc.B))
+
+# Summarize as mean, max, and cumulative expression for each gene
+idc.B %<>% rowwise() %>% mutate(idcB.max=max(c_across(where(is.numeric))),
+                                idcB.mean=mean(c_across(where(is.numeric))),
+                                idcB.cumul=sum(c_across(starts_with('T')))
+) %>%
+  ungroup()
+
+idc.B %>% 
+  slice_sample(n=5)
+```
+
+## F1: Discrepant expression between liver and blood  
+
+In order to compute the divergence between liver and blood stage expression **within** each model of infection, the expression values will be transformed into ranks. 
+
+```{r}
+pcyn %<>% ungroup() %>%
+  mutate(PcLiverRank=rank(P.cyn.Liver.Schizont),
+         PcBloodRank=rank(PcynB.mean))
+
+pviv %<>% ungroup() %>%
+  mutate(PvLiverRank=rank(Pviv.Lmean),
+         PvBloodRank=rank(Pviv.Bmax)) 
+
+LB.ranks <- inner_join(pcyn %>% select(Gene.ID, P.cyn.Gene.ID, PcLiverRank, PcBloodRank), 
+                       pviv %>% select(Gene.ID, P.viv.Gene.ID, PvLiverRank, PvBloodRank),
+                       by='Gene.ID'
+) %>%
+  mutate(PcRankDiff=abs(PcLiverRank-PcBloodRank),
+         PcLr=log2(PcLiverRank/PcBloodRank),
+         PvRankDiff=abs(PvLiverRank-PvBloodRank),
+         PvLr=log2(PvLiverRank/PvBloodRank))
+
+LB.ranks %>%
+  slice_sample(n=5)
+```
+
+Visualize
+
+```{r}
+p1 <- LB.ranks %>% ggplot(aes(x=PvBloodRank, y=PvLiverRank))+
+  geom_density2d_filled(show.legend = FALSE)+
+  geom_point(size=0.1, alpha=0.2, color='white')+
+  labs(x='Blood', y='Liver')+
+  ggtitle(expression(italic('P. vivax')))+
+  scale_fill_viridis_d(option='mako')+
+  scale_x_continuous(expand=expansion(mult=0))+
+  scale_y_continuous(expand=expansion(mult=0))+
+  theme_classic()+theme(aspect.ratio=1)
+
+p2 <- LB.ranks %>% ggplot(aes(x=PcBloodRank, y=PcLiverRank))+
+  geom_density2d_filled(show.legend = FALSE)+
+  geom_point(size=0.1, alpha=0.2, color='white')+
+  labs(x='Blood', y='Liver')+
+  ggtitle(expression(italic('P. cynomolgi')))+
+  scale_fill_viridis_d(option='mako')+
+  scale_x_continuous(expand=expansion(mult=0))+
+  scale_y_continuous(expand=expansion(mult=0))+
+  theme_classic()+theme(aspect.ratio=1)
+
+p1+p2+plot_annotation(title='Gene expression rank')
+```
+
+
+## F2: Log10-transformed cumulative expression across *Pf* blood stage development
+
+For the liver stage candidates, we want the genes with high expression at any point in the blood stage to score lower. 
+Because we have multiple datasets describing the blood stage, we summarize blood expression as the maximum rank across datasets for each gene.
+This will be useful for *liver* stage candidates selection, but might need to be tweaked for *blood* candidates (because it may prioritize candidates with very high expression during a very limited section of the blood stage cycle, e.g. gametocytes, which are not very abundant in circulation and are conceivably not present for a long time).
+
+
+```{r}
+idc.B %>% 
+  select(Gene.ID, Gene.Name.or.Symbol, idcB.cumul) %>%
+  slice_sample(n=5)
+```
+
+
+## F3: Correlated expression of each gene between matched life cycle stages across species
+
+### *P. cynomolgi* 100 days blood series vs. *P. falciparum* Bartfai time series   
+
+Correlation is calculated over the mean expression in each dataset.
+
+```{r}
+PcynPfal <- merge(pcyn100 %>% 
+                    select(c(Gene.ID,PcynB.mean)), 
+                  idc.B %>% rowwise() %>% 
+                    mutate(idcB.mean=mean(c_across(starts_with('T')))) %>%
+                    select(c(Gene.ID, idcB.mean)), 
+                  all.x=TRUE, all.y=FALSE) %>%
+  distinct()
+
+ct1 <- cor.test(PcynPfal$PcynB.mean, PcynPfal$idcB.mean, method='pearson')
+lr1 <- MASS::rlm(PcynB.mean ~ idcB.mean, data=PcynPfal)
+res1 <- lr1$residuals
+```
+
+Visualize  
+
+```{r}
+p1 <- ggplot(PcynPfal, aes(x=idcB.mean, y=PcynB.mean,
+                           xend=idcB.mean, yend=PcynB.mean-res1))+
+  geom_segment(alpha=0.2)+
+  geom_abline(slope=lr1$coefficients[[2]], 
+              intercept=lr1$coefficients[[1]], 
+              color='orange', size=1,)+
+  stat_cor(color='orange')+
+  theme_minimal()+theme(aspect.ratio=1)
+
+p2 <- p1+xlim(c(0,500))+ylim(c(0,1000))+
+  # theme(plot.background=element_rect(fill='white'),
+  #       axis.title=element_blank())+
+  ggtitle('Zoom in')+theme(aspect.ratio=1)
+
+p3 <- ggplot(PcynPfal, 
+             aes(x=idcB.mean, y=res1))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')+theme(aspect.ratio=1)
+
+p4 <- ggplot(PcynPfal, 
+             aes(x=PcynB.mean, y=res1))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')+theme(aspect.ratio=1)
+
+p1 + p2 + p3 + p4
+```
+
+
+### *P.falciparum* 7 stages mean vs *P. vivax* mean   
+
+```{r}
+PvivPfal <- left_join(pviv %>% select(c(Gene.ID,Pviv.Bmean)), 
+                      idc.B %>% select(c(Gene.ID,idcB.mean)), 
+                      by='Gene.ID') %>% .[complete.cases(.), ]
+
+ct2 <- cor.test(PvivPfal$Pviv.Bmean, PvivPfal$idcB.mean, method='pearson')
+lr2 <- MASS::rlm(Pviv.Bmean ~ idcB.mean, data=PvivPfal)
+res2 <- lr2$residuals
+```
+
+Visualize  
+
+```{r}
+p1 <- ggplot(PvivPfal, aes(x=idcB.mean, xend=idcB.mean, 
+                           y=Pviv.Bmean, yend=Pviv.Bmean-res2))+
+  geom_segment(alpha=0.2)+
+  geom_abline(slope=lr2$coefficients[[2]], 
+              intercept=lr2$coefficients[[1]], 
+              color='orange', size=1)+
+  stat_cor(color='orange')+
+  theme_minimal()+theme(aspect.ratio=1)
+
+p2 <- p1+xlim(c(0,500))+ylim(c(0,1000))+
+  ggtitle('Close-up')+theme(aspect.ratio=1)
+
+p3 <- ggplot(PvivPfal, aes(x=idcB.mean, y=res2))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  ggtitle('Residuals')+theme(aspect.ratio=1)
+
+p4 <- ggplot(PvivPfal, aes(x=Pviv.Bmean, y=res2))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  ggtitle('Residuals')+theme(aspect.ratio=1)
+
+p1 + p2 + p3 + p4
+```
+
+### Sallivary gland sporozoite: *P. vivax* vs *P. falciparum*
+
+We haven't read in this data yet.
+
+- *P. vivax* sporozoites   
+
+```{r}
+PvSpz <- read.delim('Data/PlasmoDB/Jex_PvivaxSpz.txt') %>% 
+  select(-c(source_id, X))
+
+colnames(PvSpz) <- gsub('(.+sporozoites\\.\\.\\.)(PvSPZ\\..+)(\\.\\.\\..+$)','\\2', colnames(PvSpz))
+colnames(PvSpz)[10] <- 'PfSPZ_Pviv'
+
+PvSpz %<>% mutate(PvSpz.mean=rowMeans(.[2:9])) %>%
+  rename(Pviv_Gene.ID=Gene.ID) %>% 
+  left_join(pviv_ort, by=c('Pviv_Gene.ID'='P.viv.Gene.ID')) %>%
+  filter(!is.na(Gene.ID))
+
+PvSpz %>%
+  slice_sample(n=5)
+```
+
+- *P. falciparum* sporozoites  
+
+```{r}
+PfSpz <- read.delim('Data/PlasmoDB/Hoffman_PfalSpz.txt') %>%
+  select(-c(source_id, gene_source_id, X))
+
+colnames(PfSpz)[3:5] <- c('Pf.sgSpz1', 'Pf.sgSpz2', 'Pf.cultSpz2')
+
+PfSpz %>%
+  slice_sample(n=5)
+```
+sporozoites. The *Pf* data needs to be summarized as average.
+
+```{r}
+SpzPvPf <- left_join(PvSpz %>% select(c(Gene.ID, PvSpz.mean)), 
+                     PfSpz, by='Gene.ID') %>%
+  rowwise() %>%
+  mutate(PfSpz.mean=mean(Pf.sgSpz1, Pf.sgSpz2)) %>% 
+  ungroup()
+
+ct3 <- cor.test(SpzPvPf$PvSpz.mean, SpzPvPf$PfSpz.mean, method='pearson')
+lr3 <- MASS::rlm(PvSpz.mean ~ PfSpz.mean, data=SpzPvPf)
+res3 <- lr3$residuals
+
+p1 <- ggplot(SpzPvPf, aes(x=PfSpz.mean, y=PvSpz.mean))+
+  geom_segment(mapping=aes(x=PfSpz.mean, xend=PfSpz.mean, 
+                           y=PvSpz.mean, yend=PvSpz.mean-res3), alpha=0.2)+
+  geom_abline(slope=lr3$coefficients[[2]], 
+              intercept=lr3$coefficients[[1]], 
+              color='orange', size=1)+
+  stat_cor(color='orange')+
+  theme_minimal()+theme(aspect.ratio=1)
+
+p2 <- p1+xlim(c(0,500))+ylim(c(0,1000))+
+  ggtitle('Zoom in')+theme(aspect.ratio=1)
+
+p3 <- ggplot(SpzPvPf, aes(x=PfSpz.mean, y=res3))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+theme(aspect.ratio=1)
+ggtitle('Residuals')
+
+p4 <- ggplot(SpzPvPf, aes(x=PvSpz.mean, y=res3))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  theme(aspect.ratio=1)+
+  ggtitle('Residuals')
+
+p1 + p2 + p3 + p4
+
+```
+
+### Assexual blood stages: *P. falciparum* vs. *P. berghei* 
+
+We haven't loaded this data yet.
+
+- *P. berghei* (Hoeijmaker): this dataset has synchronized enriched isolated stages that will be compared to the *Pf* 7 stages dataset.  
+
+```{r}
+pber_ort <- read.delim('Data/PlasmoDB/PberPfal_SyntenicOrthologs.txt') %>% 
+  select(-c(2,4)) %>% 
+  rename(Pber_Gene.ID=Input.Ortholog.s.)
+
+pber.H <- read.delim('Data/PlasmoDB/Hoeijmaker_Kant_PbergheiBloodStages.txt') %>% 
+  select(c(1, grep('Asex_sex.RNA.Seq', colnames(.))))
+
+colnames(pber.H) <- gsub('(.+)(\\.\\.\\.unique.+)', '\\1', colnames(pber.H))
+
+pber.H %<>% mutate(PbRing.mean=rowMeans(.[,grep('Ring', names(.))]),
+                   PbTroph.mean=rowMeans(.[,grep('Trophozoite', colnames(.))]),
+                   PbSchiz.mean=rowMeans(.[,grep('Schizont', colnames(.))]),
+                   PbGam.mean=rowMeans(.[,grep('Gametocyte', colnames(.))])) %>%
+  rename(PbOokinete=cl15cy1...Ookinete) %>% select(Gene.ID, PbOokinete, grep('.mean', colnames(.))) %>%
+  rename(Pber_Gene.ID=Gene.ID) %>%
+  merge(pber_ort, ., by='Pber_Gene.ID', all=FALSE)
+```
+
+```{r}
+PbPf1 <- sevenstg %>%
+  inner_join(pber.H, by='Gene.ID') %>%
+  rowwise() %>%
+  mutate(PfTroph.mean=mean(Early.Trophozoite, Late.Trophozoite),
+         PfGam.mean=mean(Gametocyte.II, Gametocyte.V)) %>%
+  ungroup()
+
+PbPf1 %>%
+  slice_sample(n=5)
+```
+
+##### Ring
+
+```{r}
+ct4ring <- cor.test(PbPf1$PbRing.mean, PbPf1$Ring, method='pearson')
+lr4ring <- MASS::rlm(PbRing.mean ~ Ring, data=PbPf1)
+res4ring <- lr4ring$residuals
+
+p1 <- ggplot(PbPf1, aes(x=Ring, y=PbRing.mean))+
+  geom_segment(mapping=aes(x=Ring, xend=Ring, y=PbRing.mean, yend=PbRing.mean-res4ring), 
+               alpha=0.2)+
+  geom_abline(slope=lr4ring$coefficients[[2]], 
+              intercept=lr4ring$coefficients[[1]], color='orange', size=1)+
+  stat_cor(color='orange')+
+  xlab(expression(italic('P. falciparum')))+
+  ylab(expression(italic('P.berghei')))+
+  theme_minimal()+theme(aspect.ratio=1)
+
+p2 <- p1+xlim(c(0,500))+ylim(c(0,1000))+
+  theme(aspect.ratio=1)
+ggtitle('Zoom in')
+
+p3 <- ggplot(PbPf1, aes(x=Ring, y=res4ring))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+p4 <- ggplot(PbPf1, aes(x=PbRing.mean, y=res4ring))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+(p1+ggtitle('Ring'))+p2+p3+p4
+
+```
+
+#####Schizont
+
+```{r}
+ct4schiz <- cor.test(PbPf1$PbSchiz.mean, PbPf1$Schizont, method='pearson')
+lr4schiz <- MASS::rlm(PbSchiz.mean ~ Schizont, data=PbPf1)
+res4schiz <- lr4schiz$residuals
+
+p1 <- ggplot(PbPf1, aes(x=Schizont, y=PbSchiz.mean))+
+  geom_segment(mapping=aes(x=Schizont, xend=Schizont, y=PbSchiz.mean, yend=PbSchiz.mean-res4schiz), alpha=0.2)+
+  geom_abline(slope=lr4schiz$coefficients[[2]], 
+              intercept=lr4schiz$coefficients[[1]], color='orange', 
+              size=1)+
+  stat_cor(color='orange')+
+  xlab(expression(italic('P. falciparum')))+
+  ylab(expression(italic('P.berghei')))+
+  theme_minimal()
+
+p2 <- p1+xlim(c(0,500))+ylim(c(0,1000))+
+  ggtitle('Zoom in')
+
+p3 <- ggplot(PbPf1, aes(x=Schizont, y=res4schiz))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+p4 <- ggplot(PbPf1, aes(x=PbSchiz.mean, y=res4schiz))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+(p1+ggtitle('Schizont'))+p2+p3+p4
+```
+
+
+##### Trophozoite
+
+```{r}
+ct4troph <- cor.test(PbPf1$PbTroph.mean, PbPf1$PfTroph.mean, method='pearson')
+lr4troph <- MASS::rlm(PbTroph.mean ~ PfTroph.mean, data=PbPf1, maxit=40)
+res4troph <- lr4troph$residuals
+
+p1 <- ggplot(PbPf1, aes(x=PfTroph.mean, y=PbTroph.mean))+
+  geom_segment(mapping=aes(x=PfTroph.mean, xend=PfTroph.mean, 
+                           y=PbTroph.mean, yend=PbTroph.mean-res4troph), 
+               alpha=0.2)+
+  geom_abline(slope=lr4troph$coefficients[[2]], 
+              intercept=lr4troph$coefficients[[1]], 
+              color='orange', size=1)+
+  stat_cor(color='orange')+
+  xlab(expression(italic('P. falciparum')))+ylab(expression(italic('P.berghei')))+
+  theme_minimal()
+
+p2 <- p1+xlim(c(0,500))+ylim(c(0,1000))+
+  ggtitle('Zoom in')
+
+p3 <- ggplot(PbPf1, aes(x=PfTroph.mean, y=res4troph))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+p4 <- ggplot(PbPf1, aes(x=PbTroph.mean, y=res4troph))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+(p1+ggtitle('Trophozoite')) +p2+p3+p4
+```
+
+
+##### Gametocyte    
+
+```{r}
+ct4gam <- cor.test(PbPf1$PbGam.mean, PbPf1$PfGam.mean, method='pearson')
+lr4gam <- MASS::rlm(PbGam.mean ~ PfGam.mean, data=PbPf1)
+res4gam <- lr4gam$residuals
+
+p1 <- ggplot(PbPf1, aes(x=PfGam.mean, y=PbGam.mean))+
+  geom_segment(mapping=aes(x=PfGam.mean, xend=PfGam.mean, 
+                           y=PbGam.mean, yend=PbGam.mean-res4gam), 
+               alpha=0.2)+
+  geom_abline(slope=lr4gam$coefficients[[2]], 
+              intercept=lr4gam$coefficients[[1]], 
+              color='orange', size=1)+
+  stat_cor(color='orange')+
+  xlab(expression(italic('P. falciparum')))+ylab(expression(italic('P.berghei')))+
+  theme_minimal()
+
+p2 <- p1+xlim(c(0,500))+ylim(c(0,1000))+
+  ggtitle('Zoom in')
+
+p3 <- ggplot(PbPf1, aes(x=PfGam.mean, y=res4gam))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+p4 <- ggplot(PbPf1, aes(x=PbGam.mean, y=res4gam))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+(p1+ggtitle('Gametocytes')) +p2+p3+p4
+```
+
+
+### IEDC: *P. falciparum*  (Bartfai) vs. *P.berghei* (Kant)   
+
+Correlation between the Bartfai and the Kant (*Pb*) datasets. The *Pb* data hasn't been loaded yet. Since this is a time series dataset, it needs to be summarized as the mean expression across timepoints for each gene.
+
+```{r}
+pber.K <- read.delim('Data/PlasmoDB/Hoeijmaker_Kant_PbergheiBloodStages.txt') %>% 
+  select(c(1, grep('Control.Asexual', colnames(.))))
+
+colnames(pber.K) <- gsub('(.+Control\\.Asexual\\.)([[:digit:]]+)(hr.+)', 'PbT\\2', 
+                         colnames(pber.K))
+
+pber.K %<>% rowwise() %>% 
+  mutate(Pber.Bmean=mean(c_across(where(is.numeric))))
+
+pber.K %<>% rename(Pber_Gene.ID=Gene.ID) %>% 
+  merge(pber_ort, ., by='Pber_Gene.ID', all=FALSE)
+
+pber.K %>% 
+  slice_sample(n=5)
+```
+
+
+```{r}
+PbPf2 <- inner_join(idc.B %>% select(c(Gene.ID, idcB.mean)),
+                    pber.K %>% select(c(Gene.ID, Pber.Bmean)),
+                    by='Gene.ID')
+
+ct5 <- cor.test(PbPf2$Pber.Bmean, PbPf2$idcB.mean,
+                method='pearson')
+lr5 <- MASS::rlm(Pber.Bmean ~ idcB.mean,
+                 data=PbPf2)
+
+res5 <- lr5$residuals
+
+p1 <- ggplot(PbPf2, aes(x=idcB.mean, y=Pber.Bmean))+
+  geom_segment(mapping=aes(x=idcB.mean, xend=idcB.mean, 
+                           y=Pber.Bmean, yend=Pber.Bmean-res5), 
+               alpha=0.2)+
+  geom_abline(slope=lr5$coefficients[[2]], 
+              intercept=lr5$coefficients[[1]], 
+              color='orange',size=1)+
+  stat_cor(color='orange')+
+  xlab(expression(paste(italic('P. falciparum'), ' (Toenhake 2018)')))+
+  ylab(expression(italic('P.berghei')))+
+  theme_minimal()
+
+p2 <- p1+xlim(c(0,500))+ylim(c(0,1000))+
+  ggtitle('Zoom in')
+
+p3 <- ggplot(PbPf2, aes(x=idcB.mean, y=res5))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+p4 <- ggplot(PbPf2, aes(x=Pber.Bmean, y=res5))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+(p1+ggtitle('IDC time series')) +p2+p3+p4
+```
+
+
+### IEDC: *P. falciparum*  (Hoeijmaker) vs. *P.berghei* (Kant)   
+
+```{r}
+idc.H <- read.xlsx('Data/PlasmoDB/Hoeijmaker_PfIDCtimepoints.xlsx')
+
+colnames(idc.H) <- gsub('(sense\\.-\\.)(.+)(\\.hours.+)', 't\\2hpi', colnames(idc.H))
+
+idc.H %<>% select(-c(2, 12))
+
+colnames(idc.H) <- gsub(' ', '\\.', colnames(idc.H))
+
+idc.H %<>% rowwise() %>% 
+  mutate(idcH.max=max(c_across(where(is.numeric))),
+         idcH.mean=mean(c_across(where(is.numeric))),
+         idcH.cumul=sum(c_across(ends_with('hpi'))) 
+         )
+
+idc.H %>%
+  slice_sample(n=5)
+```
+
+```{r}
+PbPf3 <- inner_join(idc.H[,c('Gene.ID','idcH.mean')], 
+                    pber.K[,c('Gene.ID','Pber.Bmean')], 
+                    by='Gene.ID')
+
+ct6 <- cor.test(PbPf3$Pber.Bmean, 
+                PbPf3$idcH.mean, 
+                method='pearson')
+
+lr6 <- MASS::rlm(Pber.Bmean ~ idcH.mean, data=PbPf3)
+res6 <- lr6$residuals
+
+p1 <- ggplot(PbPf3, aes(x=idcH.mean, xend=idcH.mean, 
+                        y=Pber.Bmean, yend=Pber.Bmean-res6))+
+  geom_segment(alpha=0.2)+
+  geom_abline(slope=lr6$coefficients[[2]], 
+              intercept=lr6$coefficients[[1]], 
+              color='orange',size=1)+
+  stat_cor(color='orange')+
+  xlab(expression(paste(italic('P. falciparum'), ' (Hoeijmaker)')))+
+  ylab(expression(italic('P.berghei')))+
+  theme_minimal()
+
+p2 <- p1+xlim(c(0,500))+ylim(c(0,1000))+
+  ggtitle('Zoom in')
+
+p3 <- ggplot(PbPf3, aes(x=idcH.mean, y=res6))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+p4 <- ggplot(PbPf3, aes(x=Pber.Bmean, y=res6))+
+  geom_point(color='firebrick', size=0.3)+
+  geom_smooth(color='darkorchid4',fill='darkorchid4')+
+  theme_minimal()+
+  ggtitle('Residuals')
+
+(p1+ggtitle('IDC time series'))+p2+p3+p4
+```
+
+
+
+
+
+### Consolidate residuals
+
+- In order to calculate the F3 of the score, we need to consolidate the residuals for each correlation.  
+- The residual is transformed as its fraction over the theoretical value according to the rlm for that gene (because of the observation made from the plots above that the size of the residuals increases with the value of gene expression).  
+-The final calculated metric `R` is the sum of all the residuals for each gene.  
+
+
+```{r}
+r1 <- data.frame('Gene.ID'=PcynPfal$Gene.ID,
+                 'XbPc'=PcynPfal$PcynB.mean,
+                 'XbPf'=PcynPfal$idcB.mean,
+                 'ResidualPcBlood'=res1) %>%
+  rowwise() %>% 
+  mutate(RbPc=ResidualPcBlood/(lr1$coefficients[[1]]+lr1$coefficients[[2]]*XbPf)) 
+
+r2 <- data.frame('Gene.ID'=PvivPfal$Gene.ID,
+                 'XbPv'=PvivPfal$Pviv.Bmean,
+                 'XbPf'=PvivPfal$idcB.mean,
+                 'ResidualPvBlood'=res2) %>%
+  rowwise() %>% mutate(RbPv=ResidualPvBlood/(lr2$coefficients[[1]]+lr3$coefficients[[2]]*XbPf))
+
+r3 <- data.frame('Gene.ID'=SpzPvPf$Gene.ID,
+                 'XsPf'=SpzPvPf$Pf.sgSpz1,
+                 'XsPv'=SpzPvPf$PvSpz.mean,
+                 'ResidualPvSpz'=res3) %>%
+  rowwise() %>% mutate(RsPv=ResidualPvSpz/(lr3$coefficients[[1]]+lr3$coefficients[[2]]*XsPf))
+
+r4 <- data.frame('Gene.ID'=PbPf1$Gene.ID,
+                 'XrPb'=PbPf1$PbRing.mean,
+                 'XrPf'=PbPf1$Ring,
+                 'ResidualPbPfRing'=res4ring,
+                 'XscPb'=PbPf1$PbSchiz.mean,
+                 'XscPf'=PbPf1$Schizont,
+                 'ResidualPbPfSchizont'=res4schiz,
+                 'XtPb'=PbPf1$PbTroph.mean,
+                 'XtPf'=PbPf1$PfTroph.mean,
+                 'ResidualPbPfTroph'=res4troph,
+                 'XgPb'=PbPf1$PbGam.mean,
+                 'XgPf'=PbPf1$PfGam.mean,
+                 'ResidualPbPfGam'=res4gam) %>%
+  rowwise() %>% mutate(RrPb=ResidualPbPfRing/(lr4ring$coefficients[[1]]+lr4ring$coefficients[[2]]*XrPf),
+                       RscPb=ResidualPbPfSchizont/(lr4schiz$coefficients[[1]]+lr4schiz$coefficients[[2]]*XscPf),
+                       RtPb=ResidualPbPfTroph/(lr4troph$coefficients[[1]]+lr4troph$coefficients[[2]]*XtPf),
+                       RgPb=ResidualPbPfGam/(lr4gam$coefficients[[1]]+lr4gam$coefficients[[2]]*XgPf))
+
+r5 <- data.frame('Gene.ID'=PbPf2$Gene.ID,
+                 'XbPb'=PbPf2$Pber.Bmean,
+                 'XbPf'=PbPf2$idcB.mean,
+                 'ResidualPbPfBlood'=res5) %>%
+  rowwise() %>% mutate(RbPb.B=ResidualPbPfBlood/(lr5$coefficients[[1]]+lr5$coefficients[[2]]*XbPf)) 
+
+r6 <- data.frame('Gene.ID'=PbPf3$Gene.ID,
+                 'XbPb'=PbPf3$Pber.Bmean,
+                 'XbPf'=PbPf3$idcH.mean,
+                 'ResidualPbPfBlood'=res6) %>%
+  rowwise() %>% mutate(RbPb.H=ResidualPbPfBlood/(lr6$coefficients[[1]]+lr6$coefficients[[2]]*XbPf))
+
+Res <- merge(r1[,c('Gene.ID','RbPc')], 
+             r2[,c('Gene.ID','RbPv')], by='Gene.ID') %>% 
+  merge(., r3[, c('Gene.ID','RsPv')], by='Gene.ID') %>%
+  merge(., r4[, c('Gene.ID', 'RrPb','RscPb','RtPb','RgPb')], by='Gene.ID') %>%
+  merge(., r5[,c('Gene.ID','RbPb.B')], by='Gene.ID') %>%
+  merge(., r6[,c('Gene.ID','RbPb.H')], by='Gene.ID') %>%
+  distinct(.keep_all=TRUE)  
+
+
+Res %<>% rowwise() %>% mutate(R=sum(abs(c_across(where(is.numeric)))))
+head(Res)
+```
+
+
+## Calculate the scores
+
+```{r}
+scoring <- LB.ranks %>% select(c(Gene.ID, PcLr, PcRankDiff, PvLr, PvRankDiff)) %>%
+  inner_join(Res %>% select(c(Gene.ID, R)), 
+             by='Gene.ID') %>% 
+  inner_join(idc.B %>% select(Gene.ID, Gene.Name.or.Symbol, idcB.cumul), 
+             by='Gene.ID') %>% 
+  rowwise() %>% 
+  mutate(logCumul=log10(idcB.cumul))
+
+maxCumul = max(scoring$logCumul)
+minCumul = min(scoring$logCumul)
+scoring %<>% rowwise() %>%
+  mutate(mu=(logCumul-minCumul)/(maxCumul-minCumul))
+
+
+scoring %<>%  rowwise() %>% 
+  mutate( F1= ( PcLr*abs(PcRankDiff) ) + ( PvLr*abs(PvRankDiff) ),
+          F3= 1/(abs(R))) %>%
+  mutate(F2=ifelse(F1>0, 1-mu, ifelse(F1<0, mu, 0))) %>%
+  mutate(Score=F1*F2*F3) %>% 
+  distinct() %>%
+  ungroup()
+
+scoring %>%
+  select(Gene.ID, Gene.Name.or.Symbol, F1, F2, F3, Score) %>%
+  arrange(-Score)
+```
+
+
+#### Visualize
+
+```{r}
+scoring %<>% 
+  rowwise() %>%
+  mutate(Gene.label=ifelse(Gene.Name.or.Symbol!='N/A', Gene.Name.or.Symbol, Gene.ID))
+```
+
+- How does expression look vs new and old score?  
+
+```{r}
+p1 <- scoring %>% left_join(LB.ranks, by='Gene.ID') %>%
+  ggplot(aes(x=PvBloodRank, y=PvLiverRank, color=Score))+
+  geom_point(alpha=0.7, size=0.3)+
+  labs(x='Blood', y='Liver')+
+  ggtitle(expression(italic('P. vivax')))+
+  scale_color_viridis_c(option='inferno')+
+  theme_classic()+theme(aspect.ratio=1)
+
+p2 <- scoring %>% left_join(LB.ranks, by='Gene.ID') %>%
+  ggplot(aes(x=PcBloodRank, y=PcLiverRank, color=Score))+
+  geom_point(alpha=0.7, size=0.3)+
+  labs(x='Blood', y='Liver')+
+  ggtitle(expression(italic('P. cynomolgi')))+
+  scale_color_viridis_c(option='inferno')+
+  theme_classic()+theme(aspect.ratio=1)
+
+(p1|p2)&plot_annotation(title='Rank of expression')
+```
+
+```{r}
+scoring %>% 
+  left_join(idc.B, by='Gene.ID') %>%
+  select(c(Gene.ID, Score, starts_with('T'))) %>%
+  pivot_longer(cols=starts_with('T'), 
+               names_to='Time',
+               values_to='Expression') %>%
+  mutate(Time=as.numeric(gsub('T', '', Time))) %>%
+  arrange(-Score) %>%
+  ggplot(aes(x=Time, y=Expression, color=Score, 
+             group=Gene.ID))+
+  geom_line(mapping=aes(order=Score))+
+  scale_color_viridis_c(option='inferno')+
+  scale_y_log10(oob=oob_squish)+annotation_logticks(outside=TRUE, sides='l')+
+  scale_x_continuous(expand=expansion(mult=0))+
+  theme_classic()
+```
+
+## Save results
+
+```{r, eval=FALSE}
+write.table(scoring, 
+            file='GeneExpressionScores.txt', 
+            sep='\t', quote=FALSE, row.names=FALSE)
+```
+
